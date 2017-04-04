@@ -2,8 +2,6 @@
 
 .code
 
-
-
 parasite PROC
 ssbase:
 call overdata
@@ -124,9 +122,9 @@ pop rax
 cmp qword ptr [rax+5+1],0
 jnz once_c
 
-push qword ptr [rsp+130h]
+push qword ptr [rsp+666h] ; this 666 is fixed when overwriting Host64ToVmm
 pop qword ptr [rax+5+1]
-mov [rsp+130h], rax
+mov [rsp+666h], rax ; this 666 is fixed when overwriting Host64ToVmm
 
 once_c:
 ret
